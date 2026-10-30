@@ -19,6 +19,6 @@ echo   لإيقاف السيرفر: اضغط CTRL+C
 echo ==============================================
 echo.
 
-python app.py
+python main.py
 
 pause

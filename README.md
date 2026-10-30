@@ -40,14 +40,14 @@
 | الطبقة             | التقنية                                                       |
 | ------------------ | ------------------------------------------------------------- |
 | Backend            | Flask / Python                                                |
-| LLM (أساسي - إلزامي) | Google Gemini API                                            |
-| نموذج المحادثة الأساسي | `gemini-3.6-flash`                                          |
-| LLM (بديل 1 - اختياري) | Groq API                                                  |
-| نموذج المحادثة البديل | `openai/gpt-oss-120b` عبر Groq                              |
-| LLM (بديل 2 - اختياري) | OpenRouter API                                            |
-| نموذج المحادثة الاحتياطي | `openrouter/free` (راوتر تلقائي يختار أفضل نموذج مجاني متاح) |
+| LLM (أول محاولة - اختياري) | Groq API                                              |
+| نموذج Groq              | `openai/gpt-oss-120b`                                        |
+| LLM (إلزامي) | Google Gemini API (يُستخدم عند فشل Groq أو عدم ضبطه)         |
+| نموذج Gemini            | `gemini-3.6-flash`                                           |
+| LLM (احتياطي أخير - اختياري) | OpenRouter API                                      |
+| نموذج OpenRouter        | `openrouter/free` (راوتر تلقائي يختار أفضل نموذج مجاني متاح) |
 | SDK                | OpenAI-compatible SDK لكل المزودين الثلاثة                    |
-| Image Generation   | Pollinations Image API                                        |
+| Image Generation   | Pollinations (أساسي) ← Hugging Face FLUX (احتياطي)             |
 | Image Tool Calling | OpenAI-compatible Tool Calling                                |
 | Vision AI          | `qwen/qwen3.6-27b` عبر Groq                                   |
 | Embeddings         | Hugging Face Inference Providers                              |
@@ -73,30 +73,18 @@
                                    │
                                    ▼
                          ┌────────────────────┐
-                         │   Flask Backend    │
+                         │   Flask (main.py)  │
                          └─────────┬──────────┘
                                    │
                  ┌─────────────────┼─────────────────┐
-                 │                 │                 │
                  ▼                 ▼                 ▼
            ┌──────────┐      ┌──────────┐      ┌─────────────┐
            │  Chat    │      │   RAG    │      │ Image Tool  │
            └────┬─────┘      └────┬─────┘      └──────┬──────┘
                 │                 │                    │
                 ▼                 ▼                    ▼
-         ┌─────────────┐       FAISS             Pollinations
-         │ Gemini (أساسي)│          ▲
-         └──────┬──────┘          │
-                │ فشل؟      Hugging Face
-                ▼
-         ┌─────────────┐
-         │    Groq     │
-         └──────┬──────┘
-                │ فشل؟
-                ▼
-         ┌─────────────┐
-         │ OpenRouter  │
-         └─────────────┘
+        Groq → Gemini →       FAISS ◄── Hugging   Pollinations → HF FLUX
+          OpenRouter                       Face    (كشف صورة الحد + حفظ محلي)
 ```
 
 ---
@@ -108,9 +96,9 @@
 ## 🔗 ترتيب المحاولة
 
 ```text
-1️⃣  Google Gemini   → gemini-3.6-flash   (إلزامي)
-2️⃣  Groq            → openai/gpt-oss-120b (اختياري)
-3️⃣  OpenRouter       → openrouter/free    (اختياري)
+1️⃣  Groq        → openai/gpt-oss-120b (اختياري، يُتخطى إن لم يُضبط مفتاحه)
+2️⃣  Gemini      → gemini-3.6-flash    (إلزامي)
+3️⃣  OpenRouter  → openrouter/free     (اختياري)
 ```
 
 يتم تجربة المزودين بالترتيب أعلاه. عند فشل مزود لأي سبب (ازدحام طلبات، انتهاء كوتة، انقطاع خدمة)، ينتقل النظام تلقائياً للمزود التالي، من دون أي تدخل من المستخدم.
@@ -139,7 +127,7 @@ MAX_RETRY_WAIT = 8 ثوانٍ
 
 يحتفظ المشروع بآخر **4 رسائل** فقط كسياق يُرسل للنموذج في كل طلب (لتقليل استهلاك التوكنز).
 
-> 💡 لماذا Gemini إلزامي؟ لأنه المزود الأساسي الذي لا يعمل المشروع بدونه؛ Groq وOpenRouter طبقتان احتياطيتان اختياريتان يتخطاهما النظام تلقائياً بدون خطأ في حال عدم ضبط مفاتيحهما.
+> 💡 لماذا Gemini إلزامي؟ لأن `main.py` يتوقف عند التشغيل إذا لم يجد `GEMINI_API_KEY`، فهو الضمان الأخير الذي لا يعمل المشروع بدونه. Groq وOpenRouter اختياريان يتخطاهما النظام تلقائياً إن لم تُضبط مفاتيحهما.
 
 > 🔄 لماذا `openrouter/free` بدلاً من نموذج مجاني محدد؟ لأن قائمة النماذج المجانية على OpenRouter تتغيّر وتُسحب باستمرار (مثلاً توقفت عائلة Llama المجانية بالكامل في وقت من الأوقات). `openrouter/free` هو الراوتر التلقائي الرسمي من OpenRouter، يختار بنفسه أفضل نموذج مجاني متاح حالياً، مما يجعل هذه الطبقة الاحتياطية مستقرة حتى لو تغيّرت أو أُلغيت نماذج مجانية معينة مستقبلاً.
 
@@ -169,44 +157,33 @@ generate_image
 طلب المستخدم
      │
      ▼
-LLM النشط (Groq / Gemini / OpenRouter)
+LLM النشط ──► Tool Calling ──► generate_image(prompt)
      │
      ▼
-Tool Calling
+السيرفر يجلب الصورة بنفسه
+     │
+     ├─► Pollinations (محاولتان، seed عشوائي)
+     │        └─ هل هي صورة "At its limit"؟ ◄── كشف بالحجم + OCR
+     │
+     ├─► Hugging Face FLUX (احتياطي)
      │
      ▼
-generate_image
-     │
-     ▼
-Image Prompt
-     │
-     ▼
-Pollinations Image API
-     │
-     ▼
-Image URL
-     │
-     ▼
-واجهة المستخدم
+حفظ في storage/generated  ──►  /generated/<id>.jpg  ──►  الواجهة
 ```
 
-يستخدم المشروع دالة:
+> ⚠️ **لماذا لا نمرّر رابط Pollinations للمتصفح؟** عند امتلاء الخدمة المجانية لا يُرجع Pollinations خطأ HTTP، بل **صورة** مكتوب عليها "At its limit right now". لذلك يجلب السيرفر الصورة ويتحقق منها (الحجم المطلوب 1024×1024 + OCR لعبارات صورة الحد) قبل عرضها. إذا فشلت كل المزودات تظهر رسالة "الخدمة مشغولة" بدل صورة خاطئة.
+
+الدالة المسؤولة:
 
 ```python
-generate_image_url(
-    prompt,
-    width=1024,
-    height=1024
-)
+generate_image_url(prompt, width=1024, height=1024)  # تُرجع رابطاً محلياً /generated/...
 ```
 
-والحجم الافتراضي للصورة هو:
+والحجم الافتراضي: `1024 × 1024`.
 
-```text
-1024 × 1024
-```
+يُحتفظ بآخر 200 صورة مولّدة فقط (`MAX_GENERATED_FILES`) لتوفير المساحة.
 
----
+* * *
 
 ## 🪄 Image Tool
 
@@ -233,7 +210,7 @@ prompt
 * الأسلوب الفني
 * التفاصيل البصرية
 
-ثم يستخدم التطبيق هذا الوصف لإنشاء رابط الصورة.
+ثم يستخدم التطبيق هذا الوصف لتوليد الصورة وحفظها وإنشاء رابطها.
 
 ---
 
@@ -258,7 +235,7 @@ POST /api/generate-image
 ```json
 {
   "status": "ok",
-  "image_url": "...",
+  "image_url": "/generated/3f2a....jpg",
   "prompt": "A cute cartoon cat programming on a laptop"
 }
 ```
@@ -720,7 +697,8 @@ Who programmed you?
 ```text
 wiam-dev-chatbot/
 │
-├── app.py                    # تطبيق Flask ومنطق المحادثة والـAPI
+├── main.py                   # تطبيق Flask ومنطق المحادثة والـAPI
+├── database.py               # حفظ المحادثات (SQLite / PostgreSQL)
 ├── rag.py                    # محرك RAG ومعالجة المستندات والصور
 │
 ├── templates/
@@ -746,8 +724,8 @@ wiam-dev-chatbot/
 ## المتطلبات
 
 * Python 3.10 أو أحدث
-* حساب ومفتاح API من **Google Gemini** (المزود الأساسي والإلزامي للمحادثة)
-* حساب ومفتاح API من **Groq** (مزود بديل اختياري عند فشل Gemini، وأيضاً مطلوب لتحليل الصور عبر Vision AI)
+* حساب ومفتاح API من **Google Gemini** (إلزامي: لا يعمل المشروع بدونه)
+* حساب ومفتاح API من **Groq** (اختياري: يُجرَّب أولاً في المحادثة، وهو مطلوب أيضاً لتحليل الصور عبر Vision AI)
 * حساب ومفتاح API من **OpenRouter** (مزود بديل ثالث واختياري، لمزيد من الاستقرار)
 * مفتاح Hugging Face
 * Tesseract OCR لدعم قراءة الصور النصية
@@ -758,7 +736,7 @@ wiam-dev-chatbot/
 # 1️⃣ استنساخ المشروع
 
 ```bash
-git clone https://github.com/wiam-boop/wiam-dev-chatbot.git
+git clone https://github.com/wiam-bahri/wiam-dev-chatbot.git
 cd wiam-dev-chatbot
 ```
 
@@ -826,9 +804,22 @@ HF_API_KEY=hf_xxxxxxxxxxxxxxxxx
 FLASK_SECRET_KEY=your_random_secret_key
 ```
 
-> `GEMINI_API_KEY` هو المزود **الأساسي والإلزامي** للمحادثة — بدونه لا يعمل المشروع إطلاقاً.
-> `GROQ_API_KEY` **اختياري** — يُستخدم كمزود بديل أول عند فشل أو ازدحام Gemini، وهو مطلوب أيضاً لتحليل الصور (Vision AI) داخل `rag.py`. لو لم يتم ضبطه، يتخطى النظام هذه الطبقة تلقائياً.
-> `OPENROUTER_API_KEY` **اختياري** — يُستخدم كمزود بديل ثالث وأخير عند فشل Gemini وGroq معاً. لو لم يتم ضبطه، يتخطى النظام هذه الطبقة تلقائياً بدون أي خطأ.
+> `GEMINI_API_KEY` **إلزامي**: بدونه يتوقف التطبيق عند التشغيل.
+> `GROQ_API_KEY` **اختياري**: يُجرَّب أولاً في المحادثة، وهو مطلوب أيضاً لتحليل الصور (Vision AI) داخل `rag.py`.
+> `OPENROUTER_API_KEY` **اختياري**: الطبقة الأخيرة عند فشل Groq وGemini معاً.
+> `HF_API_KEY` مطلوب للـEmbeddings (RAG)، ويُستخدم أيضاً كمزود احتياطي لتوليد الصور.
+
+### متغيرات اختيارية إضافية
+
+```env
+POLLINATIONS_API_KEY=        # من enter.pollinations.ai لتجنب ازدحام الطبقة المجانية
+POLLINATIONS_BASE_URL=       # لتغيير عنوان خدمة Pollinations إن تغيّر
+IMAGE_PROVIDERS=pollinations,huggingface   # ترتيب مزودي الصور
+HF_IMAGE_MODEL=black-forest-labs/FLUX.1-schnell
+ADMIN_PASSWORD=              # لفتح لوحة /admin
+DATABASE_URL=                # PostgreSQL (إن تُرك فارغاً يُستخدم SQLite)
+STORAGE_PATH=                # مسار تخزين دائم (Volume على Railway)
+```
 
 ---
 
@@ -851,7 +842,7 @@ FLASK_SECRET_KEY=...
 # 4️⃣ تشغيل المشروع
 
 ```bash
-python app.py
+python main.py
 ```
 
 ثم افتح:
@@ -926,22 +917,22 @@ http://localhost:5000
 في بيئة الإنتاج، يفضل عدم استخدام:
 
 ```bash
-python app.py
+python main.py
 ```
 
 بدلاً من ذلك يمكن استخدام Gunicorn:
 
 ```bash
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
+gunicorn main:app -b 0.0.0.0:8000 --timeout 120 --workers 1 --threads 4
 ```
 
-يفضل استخدام عدد Workers منخفض لأن كل Worker قد يحمل مكونات RAG والـEmbedding في الذاكرة.
+يفضل Worker واحد مع عدة Threads: كل Worker يحمل مكونات RAG في الذاكرة، وتوليد الصورة يحجز الطلب عدة ثوانٍ، فالـThreads تمنع توقف باقي المستخدمين.
 
 ---
 
 # 🚂 Railway
 
-المشروع مجهز للنشر على Railway باستخدام:
+المشروع مجهز للنشر على Railway باستخدام (الأمر الفعلي: `gunicorn main:app --timeout 120 --workers 1 --threads 4`):
 
 ```text
 Procfile
@@ -957,6 +948,8 @@ GROQ_API_KEY
 OPENROUTER_API_KEY
 HF_API_KEY
 FLASK_SECRET_KEY
+ADMIN_PASSWORD            (اختياري)
+STORAGE_PATH              (اختياري: مسار Volume دائم)
 ```
 
 ولا يجب رفع ملف `.env`.
@@ -1008,12 +1001,14 @@ FLASK_SECRET_KEY
 | `/api/documents`          | GET    | عرض المستندات           |
 | `/api/documents/<doc_id>` | DELETE | حذف مستند               |
 | `/api/reset`              | POST   | بدء محادثة جديدة        |
+| `/generated/<file>`       | GET    | عرض صورة مولّدة         |
+| `/admin`                  | GET    | لوحة الإدارة (تحتاج `ADMIN_PASSWORD`) |
 
 ---
 
 # 🧩 المكونات الرئيسية
 
-## `app.py`
+## `main.py`
 
 مسؤول عن:
 
@@ -1075,19 +1070,16 @@ FLASK_SECRET_KEY
                          Wiam Dev ChatBot
                                 │
              ┌──────────────────┼──────────────────┐
-             │                  │                  │
              ▼                  ▼                  ▼
           Chat AI            RAG System       Image Generation
              │                  │                  │
              ▼                  ▼                  ▼
-     Gemini (أساسي)         Hugging Face        Tool Calling
-             │ فشل؟             │                  │
-             ▼                  ▼                  ▼
-        Groq (بديل)          FAISS          Pollinations
-             │ فشل؟             ▲
-             ▼                  │
-      OpenRouter (بديل)  ┌─────┴─────┐
-                          │           │
+   Groq → Gemini →         Hugging Face       Tool Calling
+     OpenRouter                 │                  │
+                                ▼                  ▼
+                              FAISS        Pollinations → HF FLUX
+                                ▲
+                          ┌─────┴─────┐
                           ▼           ▼
                          OCR      Vision AI
                      Tesseract   Qwen via Groq

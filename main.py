@@ -3,9 +3,13 @@ import re
 import json
 import uuid
 import hmac
+import io
 import time
+import random
 import urllib.parse
 
+import requests
+from PIL import Image
 from flask import Flask, request, jsonify, session, render_template, send_from_directory
 from openai import OpenAI
 from groq import Groq
@@ -407,22 +411,344 @@ ALLOWED_EXTENSIONS = {
 # IMAGE GENERATION
 # =========================================================
 
+# ─────────────────────────────────────────────────────────
+# لماذا لا نُرجع رابط Pollinations مباشرة للمتصفح؟
+#
+# عندما تمتلئ الخدمة المجانية، Pollinations لا يُرجع خطأ HTTP،
+# بل يُرجع *صورة* مكتوب عليها "At its limit right now".
+# المتصفح يعرضها كأنها نتيجة الرسم، ولا يمكن للسيرفر اكتشاف ذلك
+# إذا مرّر الرابط فقط. لذلك الآن:
+#   1) السيرفر يجلب الصورة بنفسه،
+#   2) يتأكد أنها ليست صورة الخطأ،
+#   3) يجرّب مزوداً احتياطياً (Hugging Face) إن فشل،
+#   4) يحفظ الصورة محلياً ويُرجع رابطاً محلياً /generated/...
+# ─────────────────────────────────────────────────────────
+
+GENERATED_DIR = os.path.join(rag.STORAGE_DIR, "generated")
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
+MAX_GENERATED_FILES = 200
+
+POLLINATIONS_BASE_URL = os.environ.get(
+    "POLLINATIONS_BASE_URL",
+    "https://image.pollinations.ai/prompt/"
+).strip()
+
+# اختياري: مفتاح من enter.pollinations.ai لتجنّب ازدحام الطبقة المجانية
+POLLINATIONS_API_KEY = os.environ.get(
+    "POLLINATIONS_API_KEY",
+    ""
+).strip()
+
+HF_IMAGE_MODEL = os.environ.get(
+    "HF_IMAGE_MODEL",
+    "black-forest-labs/FLUX.1-schnell"
+).strip()
+
+# ترتيب مزودي الصور (مفصولين بفاصلة). مثال لتجربة Hugging Face أولاً:
+#   IMAGE_PROVIDERS=huggingface,pollinations
+IMAGE_PROVIDERS = [
+    p.strip().lower()
+    for p in os.environ.get(
+        "IMAGE_PROVIDERS",
+        "pollinations,huggingface"
+    ).split(",")
+    if p.strip()
+]
+
+POLLINATIONS_ATTEMPTS = 2
+POLLINATIONS_TIMEOUT = 45
+
+IMAGE_BUSY_MESSAGE = (
+    "⏳ خدمة رسم الصور مشغولة حالياً بسبب كثرة الطلبات. "
+    "حاول مرة أخرى بعد قليل 🎨💜"
+)
+
+_LIMIT_IMAGE_KEYWORDS = (
+    "at its limit",
+    "free service is full",
+    "reload in a few seconds",
+    "enter.pollinations",
+)
+
+
+class ImageGenerationError(Exception):
+    pass
+
+
+def _looks_like_limit_image(
+    image_bytes: bytes,
+    requested_size: tuple
+) -> bool:
+    """
+    يكتشف صورة "At its limit right now" الخاصة بـ Pollinations.
+
+    - الصورة الحقيقية تأتي بالحجم المطلوب (1024x1024).
+    - صورة الخطأ حجمها مختلف (768x768)، فإذا اختلف الحجم
+      نتأكد بالـ OCR من وجود عباراتها المميزة.
+    """
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception:
+        # ليست صورة صالحة أصلاً
+        return True
+
+    if img.size == requested_size:
+        return False
+
+    try:
+        import pytesseract
+
+        text = pytesseract.image_to_string(
+            img.convert("RGB")
+        ).lower()
+
+        return any(
+            keyword in text
+            for keyword in _LIMIT_IMAGE_KEYWORDS
+        )
+
+    except Exception:
+        # الحجم مختلف ولا يمكن التحقق بالـ OCR: الأسلم رفضها
+        return True
+
+
+def _fetch_pollinations(
+    prompt: str,
+    width: int,
+    height: int
+) -> bytes:
+
+    url = (
+        POLLINATIONS_BASE_URL.rstrip("/")
+        + "/"
+        + urllib.parse.quote(prompt)
+    )
+
+    params = {
+        "width": width,
+        "height": height,
+        "nologo": "true",
+        # seed عشوائي: نفس الـ seed كان يعيد نفس الصورة
+        # (وربما صورة الخطأ المخزّنة) عند إعادة التوليد
+        "seed": random.randint(1, 10_000_000),
+    }
+
+    headers = {}
+
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = (
+            f"Bearer {POLLINATIONS_API_KEY}"
+        )
+
+    last_error = None
+
+    for attempt in range(POLLINATIONS_ATTEMPTS):
+
+        try:
+
+            response = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=POLLINATIONS_TIMEOUT
+            )
+
+            content_type = response.headers.get(
+                "Content-Type",
+                ""
+            )
+
+            if (
+                response.status_code != 200
+                or not content_type.startswith("image/")
+            ):
+                raise ImageGenerationError(
+                    f"Pollinations HTTP {response.status_code}"
+                )
+
+            if _looks_like_limit_image(
+                response.content,
+                (width, height)
+            ):
+                raise ImageGenerationError(
+                    "Pollinations returned its 'limit' image"
+                )
+
+            return response.content
+
+        except Exception as e:
+
+            last_error = e
+
+            print(
+                f"[POLLINATIONS] محاولة {attempt + 1} فشلت: {e}"
+            )
+
+            if attempt < POLLINATIONS_ATTEMPTS - 1:
+
+                # seed جديد + انتظار قصير قبل إعادة المحاولة
+                params["seed"] = random.randint(1, 10_000_000)
+
+                time.sleep(3)
+
+    raise ImageGenerationError(str(last_error))
+
+
+def _fetch_huggingface(prompt: str) -> bytes:
+    """
+    مزود احتياطي عبر Hugging Face (نفس HF_API_KEY المستخدم للـ embeddings).
+    يعتمد نجاحه على المزودين/الرصيد المتاح في حسابك على Hugging Face.
+    """
+
+    if not rag.HF_API_KEY:
+        raise ImageGenerationError("HF_API_KEY غير مضبوط")
+
+    from huggingface_hub import InferenceClient
+
+    hf_client = InferenceClient(
+        api_key=rag.HF_API_KEY,
+        timeout=60
+    )
+
+    image = hf_client.text_to_image(
+        prompt,
+        model=HF_IMAGE_MODEL
+    )
+
+    buffer = io.BytesIO()
+
+    image.convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=92
+    )
+
+    return buffer.getvalue()
+
+
+def _cleanup_generated_images():
+    """يحذف أقدم الصور المولّدة حتى لا يمتلئ التخزين."""
+
+    try:
+
+        files = [
+            os.path.join(GENERATED_DIR, name)
+            for name in os.listdir(GENERATED_DIR)
+        ]
+
+        if len(files) <= MAX_GENERATED_FILES:
+            return
+
+        files.sort(key=os.path.getmtime)
+
+        for old_file in files[:-MAX_GENERATED_FILES]:
+            os.remove(old_file)
+
+    except Exception as e:
+
+        print(f"[GENERATED CLEANUP] {e}")
+
+
+def _save_generated_image(image_bytes: bytes) -> str:
+
+    try:
+        fmt = (Image.open(io.BytesIO(image_bytes)).format or "").lower()
+    except Exception:
+        fmt = ""
+
+    ext = {
+        "jpeg": "jpg",
+        "png": "png",
+        "webp": "webp"
+    }.get(fmt, "jpg")
+
+    filename = f"{uuid.uuid4().hex}.{ext}"
+
+    with open(
+        os.path.join(GENERATED_DIR, filename),
+        "wb"
+    ) as f:
+        f.write(image_bytes)
+
+    _cleanup_generated_images()
+
+    return f"/generated/{filename}"
+
+
 def generate_image_url(
     prompt: str,
     width: int = 1024,
     height: int = 1024
 ) -> str:
+    """
+    يولّد الصورة فعلياً ويُرجع رابطاً محلياً لها.
+    يرفع ImageGenerationError إذا فشلت كل المزودات.
+    """
 
-    encoded_prompt = urllib.parse.quote(prompt)
+    errors = []
 
-    return (
-        "https://image.pollinations.ai/prompt/"
-        f"{encoded_prompt}"
-        f"?width={width}"
-        f"&height={height}"
-        f"&nologo=true"
-        f"&seed={abs(hash(prompt)) % 100000}"
-    )
+    available = {
+        "pollinations": (
+            "Pollinations",
+            lambda: _fetch_pollinations(prompt, width, height)
+        ),
+        "huggingface": (
+            "HuggingFace",
+            lambda: _fetch_huggingface(prompt)
+        ),
+    }
+
+    providers = [
+        available[key]
+        for key in IMAGE_PROVIDERS
+        if key in available
+    ]
+
+    if not providers:
+        raise ImageGenerationError(
+            "IMAGE_PROVIDERS لا يحتوي على مزود صالح "
+            "(pollinations / huggingface)"
+        )
+
+    for name, fetch in providers:
+
+        try:
+
+            image_bytes = fetch()
+
+            return _save_generated_image(image_bytes)
+
+        except Exception as e:
+
+            errors.append(f"{name}: {e}")
+
+            print(f"[IMAGE {name} ERROR] {e}")
+
+    raise ImageGenerationError(" | ".join(errors))
+
+
+def build_image_reply(prompt: str):
+    """
+    يُرجع (answer, image_url). عند الفشل يُرجع رسالة ودّية
+    بدون صورة بدلاً من رفع استثناء (حتى لا يُعتبر فشلاً من
+    مزود المحادثة فيُعاد استدعاء النموذج بلا فائدة).
+    """
+
+    try:
+
+        return (
+            "تفضل، هذه الصورة التي طلبتها 🎨",
+            generate_image_url(prompt)
+        )
+
+    except ImageGenerationError as e:
+
+        print(f"[IMAGE GENERATION FAILED] {e}")
+
+        return IMAGE_BUSY_MESSAGE, None
 
 
 # =========================================================
@@ -1097,15 +1423,9 @@ def _call_llm_once(
             or outgoing_messages[-1]["content"]
         )
 
-        image_url = generate_image_url(
+        return build_image_reply(
             image_prompt
         )
-
-        answer = (
-            "تفضل، هذه الصورة التي طلبتها 🎨"
-        )
-
-        return answer, image_url
 
     # =================================================
     # NORMAL ANSWER
@@ -1129,15 +1449,9 @@ def _call_llm_once(
 
     if fake_prompt:
 
-        image_url = generate_image_url(
+        return build_image_reply(
             fake_prompt
         )
-
-        answer = (
-            "تفضل، هذه الصورة التي طلبتها 🎨"
-        )
-
-        return answer, image_url
 
     clean_answer = (
         strip_fake_image_markdown(
@@ -1395,6 +1709,12 @@ def generate_image_endpoint():
             "image_url": image_url,
             "prompt": prompt
         })
+
+    except ImageGenerationError:
+
+        return jsonify({
+            "error": IMAGE_BUSY_MESSAGE
+        }), 503
 
     except Exception as e:
 
@@ -1856,7 +2176,12 @@ def chat():
         # ── Semantic Cache: تحقق من الذاكرة أولاً ──
 
 
-        _cached = rag.semantic_cache.get(user_message)
+        # طلبات الرسم لا تُخدَّم من الكاش أبداً (كل طلب = صورة جديدة)
+        _cached = (
+            None
+            if is_image_request(user_message)
+            else rag.semantic_cache.get(user_message)
+        )
 
 
         if _cached and not context_block:
@@ -1931,7 +2256,15 @@ def chat():
     # =====================================================
     # ── احفظ في الـ Semantic Cache ──
     try:
-        if answer and not image_url and len(user_message.strip()) > 5:
+        # لا نحفظ في الكاش: طلبات الرسم، ولا رسالة "الخدمة مشغولة"
+        # (وإلا ستُعاد هذه الرسالة لكل طلب مشابه لاحقاً حتى لو عادت الخدمة)
+        if (
+            answer
+            and not image_url
+            and answer != IMAGE_BUSY_MESSAGE
+            and not is_image_request(user_message)
+            and len(user_message.strip()) > 5
+        ):
             rag.semantic_cache.set(user_message, answer)
     except Exception:
         pass
@@ -2009,6 +2342,24 @@ def serve_uploaded_file(filename):
 
     return send_from_directory(
         rag.UPLOADS_DIR,
+        filename
+    )
+
+
+# =========================================================
+# SERVE GENERATED IMAGES
+# (مجلد منفصل عن uploads حتى لا تُعتبر الصور المولّدة
+#  "آخر صورة رفعها المستخدم" في وصف الصور/استخراج النص)
+# =========================================================
+
+@app.route(
+    "/generated/<path:filename>",
+    methods=["GET"]
+)
+def serve_generated_image(filename):
+
+    return send_from_directory(
+        GENERATED_DIR,
         filename
     )
 
